@@ -15,30 +15,130 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
+from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
 
-    def __init__(self, ndim, bias):
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5):
+        """
+        Initialize the RMSNorm normalization layer.
+
+        Args:
+            dim (int): The dimension of the input tensor.
+            eps (float, optional): A small value added to the denominator for numerical stability. Default is 1e-6.
+        """
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    """
+    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+
+    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
+    and the end index 'end'. The 'theta' parameter scales the frequencies.
+    The returned tensor contains complex values in complex64 data type.
+
+    Args:
+        dim (int): Dimension of the frequency tensor.
+        end (int): End index for precomputing frequencies.
+        theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
+
+    Returns:
+        torch.Tensor: Precomputed frequency tensor with complex exponentials.
+    """
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)  # type: ignore
+    freqs = torch.outer(t, freqs).float()  # type: ignore
+    freqs_cos = torch.cos(freqs)
+    freqs_sin = torch.sin(freqs)
+    return freqs_cos, freqs_sin
+
+
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    """
+    Reshape frequency tensor for broadcasting it with another tensor.
+
+    This function reshapes the frequency tensor to have the same shape as the target tensor 'x'
+    for the purpose of broadcasting the frequency tensor during element-wise operations.
+
+    Args:
+        freqs_cis (torch.Tensor): Frequency tensor to be reshaped.
+        x (torch.Tensor): Target tensor for broadcasting compatibility.
+
+    Returns:
+        torch.Tensor: Reshaped frequency tensor.
+
+    Raises:
+        AssertionError: If the frequency tensor doesn't match the expected shape.
+        AssertionError: If the target tensor 'x' doesn't have the expected number of dimensions.
+    """
+    ndim = x.ndim
+    assert 0 <= 1 < ndim
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
+
+def apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cos: torch.Tensor,
+    freqs_sin: torch.Tensor
+):
+    # reshape xq and xk to match the complex representation
+    xq_r, xq_i = xq.float().reshape(xq.shape[:-1] + (-1, 2)).unbind(-1)
+    xk_r, xk_i = xk.float().reshape(xk.shape[:-1] + (-1, 2)).unbind(-1)
+
+    # reshape freqs_cos and freqs_sin for broadcasting
+    freqs_cos = reshape_for_broadcast(freqs_cos, xq_r)
+    freqs_sin = reshape_for_broadcast(freqs_sin, xq_r)
+
+    # apply rotation using real numbers
+    xq_out_r = xq_r * freqs_cos - xq_i * freqs_sin
+    xq_out_i = xq_r * freqs_sin + xq_i * freqs_cos
+    xk_out_r = xk_r * freqs_cos - xk_i * freqs_sin
+    xk_out_i = xk_r * freqs_sin + xk_i * freqs_cos
+
+    # flatten last two dimensions
+    xq_out = torch.stack([xq_out_r, xq_out_i], dim=-1).flatten(3)
+    xk_out = torch.stack([xk_out_r, xk_out_i], dim=-1).flatten(3)
+
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    bs, slen, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    )
 
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        assert config.n_head % config.n_kv_head == 0
+        self.n_rep = config.n_head // config.n_kv_head
+        self.head_dim = config.n_embd // config.n_head
+        self.wq = nn.Linear(config.n_embd, config.n_head * self.head_dim, bias=False)
+        self.wk = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim, bias=False)
+        self.wv = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim, bias=False)
+        self.wo = nn.Linear(config.n_head * self.head_dim, config.n_embd, bias=False)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
@@ -49,64 +149,54 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, freqs_cos, freqs_sin):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-        # calculate query, key, values for all heads in batch
-        qkv = self.c_attn(x).view(B, T, 3, self.n_head, C // self.n_head)
+        # QKV
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq = xq.view(B, T, self.n_head, self.head_dim)
+        xk = xk.view(B, T, self.n_kv_head, self.head_dim)
+        xv = xv.view(B, T, self.n_kv_head, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cos, freqs_sin)
+
+        # grouped multiquery attention: expand out keys and values
+        xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash2:
-            # efficient attention using Flash Attention CUDA kernels
-            from flash_attn import flash_attn_qkvpacked_func
-            y = flash_attn_qkvpacked_func(qkv, dropout_p=self.dropout if self.training else 0, causal=True)
-            # y: (B, T, nh, hs).
-        else:
-            # manual implementation of attention
-            qkv = qkv.transpose(1, 3) # (B, nh, 3, T, hs)
-            q = qkv[:, :, 0, ...] # (B, nh, T, hs)
-            k = qkv[:, :, 1, ...] # (B, nh, T, hs)
-            v = qkv[:, :, 2, ...] # (B, nh, T, hs)
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-            y = y.transpose(1, 2) # (B, T, nh, hs)
+        # efficient attention using Flash Attention CUDA kernels
+        y = flash_attn_func(xq, xk, xv, dropout_p=self.dropout if self.training else 0, causal=True)
+        # y: (B, T, nh, hs).
         y = y.contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
-        y = self.resid_dropout(self.c_proj(y))
+        y = self.resid_dropout(self.wo(y))
         return y
 
-class MLP(nn.Module):
-
+class FFN(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.w1 = nn.Linear(config.n_embd, config.hidden_dim, bias=False)
+        self.w2 = nn.Linear(config.hidden_dim, config.n_embd, bias=False)
+        self.w3 = nn.Linear(config.n_embd, config.hidden_dim, bias=False)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
+        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn_norm = RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.ffn_norm = RMSNorm(config.n_embd)
+        self.ffn = None
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+    def forward(self, x, freqs_cos, freqs_sin):
+        x = x + self.attn(self.attn_norm(x), freqs_cos, freqs_sin)
+        x = x + self.ffn(self.ffn_norm(x))
         return x
 
 @dataclass
@@ -115,7 +205,9 @@ class GPTConfig:
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
+    n_kv_head: int = 12
     n_embd: int = 768
+    hidden_dim: int = n_embd * 4
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
@@ -127,19 +219,31 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        freqs_cos, freqs_sin = precompute_freqs_cis(config.n_embd // config.n_head, config.block_size * 2)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ln_f = RMSNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
+
+        # Share the unembedding parameters with the embedding parameters.
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        # optionally, share all the ffn weights.
+        share_ffn = True
+        if share_ffn:
+            ffn = FFN(config)
+            for block in self.transformer.h:
+                block.ffn = ffn
+        else:
+            for block in self.transformer.h:
+                block.ffn = FFN(config)
 
         # init all weights
         self.apply(self._init_weights)
@@ -175,14 +279,13 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        freqs_cos = self.freqs_cos[:t]
+        freqs_sin = self.freqs_sin[:t]
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, freqs_cos, freqs_sin)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
